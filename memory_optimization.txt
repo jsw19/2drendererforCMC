@@ -1,0 +1,146 @@
+2D RENDERER — MEMORY OPTIMIZATION DETAILS
+==========================================
+
+
+1. THREE-CANVAS ARCHITECTURE (Dirty-Region Isolation)
+------------------------------------------------------
+Canvases:
+  bg-canvas     (z=1) — static checkerboard, drawn once only
+  main-canvas   (z=2) — composited result of all layers
+  overlay-canvas (z=3) — live in-progress stroke only
+
+Why it matters:
+  Without the overlay, every pointermove would repaint all visible layers
+  from scratch. The overlay canvas is cleared and redrawn only for the
+  current stroke, then discarded (clearRect) on pointerup. This reduces
+  per-frame write bandwidth from:
+    layers x W x H x 4 bytes   (without overlay)
+  to just the overlay's dirty stroke region.
+
+
+2. PER-LAYER OFFSCREEN CANVASES (GPU-backed Textures)
+------------------------------------------------------
+Each layer is an HTMLCanvasElement that lives off-DOM. Browsers accelerate
+these with GPU textures — compositing is a GPU blit, not a CPU memcpy.
+
+  mainCtx.drawImage(layer.offscreen, 0, 0)
+  → single GPU draw call per layer, not pixel-by-pixel copy
+
+Freeing layer memory correctly:
+  layer.offscreen.width  = 0;   // releases GPU backing store immediately
+  layer.offscreen.height = 0;
+
+Setting width/height to 0 drops the internal Skia surface or WebGL texture
+without waiting for garbage collection. This is the correct API for
+immediate GPU memory release — nulling the reference alone is not enough.
+
+
+3. DELTA-COMPRESSED UNDO STACK
+-------------------------------
+Naive approach: store a full ImageData per undo step.
+  1280x720 canvas = 1280 x 720 x 4 = 3.69 MB per snapshot
+  40 undo steps   = 147 MB for a single layer
+
+This renderer uses delta encoding instead:
+  Only store [index, value] pairs for pixels that changed between steps.
+
+  function encodeDelta(prev, current) {
+    const diffs = [];
+    for (let i = 0; i < currData.length; i++) {
+      if (currData[i] !== prevData[i]) diffs.push(i, currData[i]);
+    }
+    return new Uint32Array(diffs).buffer;  // typed array, not JS objects
+  }
+
+A typical brush stroke touches ~1-5% of pixels, so:
+  Delta size  ≈ changedPixels x 8 bytes
+  Full size   = 3.69 MB
+  Savings     = 10x to 100x for incremental edits
+
+Delta chains resolve lazily (only on undo/redo), not eagerly.
+The stack is capped at MAX_UNDO = 40 with shift() — released ImageData
+entries have no remaining references and become GC-eligible immediately.
+
+
+4. FLOOD FILL WITH Uint8Array VISITED MASK
+-------------------------------------------
+  const visited = new Uint8Array(W * H);   // 1 byte per pixel
+
+Compared to Set<number>:
+  Set entry         ~40-80 bytes per element (V8 hash map node + pointer)
+  Uint8Array entry  exactly 1 byte per pixel
+
+For a 1280x720 canvas (921,600 pixels):
+  Set worst case    ~74 MB
+  Uint8Array        ~0.9 MB
+  Savings           ~80x
+
+The scanline stack algorithm also never pushes the same pixel twice because
+the visited[] array gates re-entry, keeping the stack bounded in size.
+
+
+5. DOCUMENTFRAGMENT FOR BATCH DOM INSERTS
+------------------------------------------
+  const frag = document.createDocumentFragment();
+  PALETTE.forEach(color => { frag.appendChild(node); });
+  el.appendChild(frag);   // single DOM write = single reflow
+
+Appending nodes one-by-one to the live DOM triggers a layout reflow per
+insertion. For 24 palette swatches that is 24 reflows. A DocumentFragment
+is never rendered itself, so all insertions are batched into one reflow
+when the fragment is finally appended.
+
+
+6. COALESCED POINTER EVENTS
+-----------------------------
+  const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ev of events) continueDraw(ev);
+
+At 240Hz stylus input the browser may queue 4+ events per pointermove
+callback. getCoalescedEvents() retrieves all of them so:
+  - No frame drops from missed intermediate positions
+  - No extra memory allocations (events are reused browser objects)
+  - Smooth curves without oversampling workarounds
+
+
+7. STROKE PATH WITHOUT PER-FRAME ALLOCATIONS
+---------------------------------------------
+The smoothed freehand path uses quadraticCurveTo on midpoints of the
+accumulated brushPoints[] array. The array is reused across the entire
+stroke lifetime:
+  - Populated on pointermove (push)
+  - Cleared on pointerup (length = 0, no reallocation)
+
+No intermediate Path2D objects are created per frame. The path is drawn
+directly to the canvas 2D context each pointermove, keeping heap churn
+to zero during active drawing.
+
+
+8. MEMORY STATS PANEL (Live Monitoring)
+-----------------------------------------
+The right panel updates every 2 seconds with:
+
+  Metric          Formula
+  --------------- -----------------------------------------
+  Canvas VRAM     W x H x 4 x 3 (three physical canvases)
+  Layer VRAM      W x H x 4 x layerCount
+  Undo stack      Sum of snapshot byteLength across all layers
+  JS Heap used    performance.memory.usedJSHeapSize (Chrome/Edge)
+  JS Heap limit   performance.memory.jsHeapSizeLimit (Chrome/Edge)
+
+This gives real-time feedback as layers are added or actions are taken,
+making memory pressure visible without external profiling tools.
+
+
+SUMMARY TABLE
+=============
+
+  Optimization          Technique                        Savings
+  -------------------- --------------------------------- -------------------------
+  Per-frame redraw      3-canvas split (overlay)          ~layers x less bandwidth
+  Layer memory release  canvas.width = 0                  Immediate GPU free
+  Undo stack            Delta encoding                    10-100x vs full snapshot
+  Flood fill visited    Uint8Array vs Set                 ~80x less heap per pixel
+  DOM batch inserts     DocumentFragment                  1 reflow vs N reflows
+  Pen input sampling    getCoalescedEvents()              0 missed samples
+  Stroke path           Reused array + direct ctx draw    0 Path2D allocs per frame

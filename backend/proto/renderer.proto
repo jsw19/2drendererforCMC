@@ -1,0 +1,235 @@
+syntax = "proto3";
+
+package renderer;
+
+option cc_generic_services = false;
+
+// ─────────────────────────────────────────────
+//  COMMON TYPES
+// ─────────────────────────────────────────────
+
+message Color {
+  uint32 r = 1;
+  uint32 g = 2;
+  uint32 b = 3;
+  float  a = 4;   // 0.0 – 1.0
+}
+
+message Vec2 {
+  float x = 1;
+  float y = 2;
+}
+
+// ─────────────────────────────────────────────
+//  LAYER
+// ─────────────────────────────────────────────
+
+message Layer {
+  string  id       = 1;
+  string  name     = 2;
+  bool    visible  = 3;
+  bool    locked   = 4;
+  uint32  width    = 5;
+  uint32  height   = 6;
+  bytes   pixels   = 7;   // raw RGBA bytes (width * height * 4)
+  uint32  order    = 8;
+}
+
+// ─────────────────────────────────────────────
+//  PROJECT
+// ─────────────────────────────────────────────
+
+message Project {
+  string         id           = 1;
+  string         name         = 2;
+  uint32         canvas_width = 3;
+  uint32         canvas_height= 4;
+  repeated Layer layers       = 5;
+  int64          created_at   = 6;   // unix ms
+  int64          updated_at   = 7;
+  string         owner_id     = 8;
+  string         thumbnail    = 9;   // base64 PNG thumbnail
+}
+
+message ProjectMeta {
+  string id            = 1;
+  string name          = 2;
+  uint32 canvas_width  = 3;
+  uint32 canvas_height = 4;
+  int64  created_at    = 5;
+  int64  updated_at    = 6;
+  string owner_id      = 7;
+  string thumbnail     = 8;
+  uint32 layer_count   = 9;
+}
+
+// ─────────────────────────────────────────────
+//  SESSION
+// ─────────────────────────────────────────────
+
+message Session {
+  string id         = 1;
+  string user_id    = 2;
+  string username   = 3;
+  int64  created_at = 4;
+  int64  expires_at = 5;
+}
+
+// ─────────────────────────────────────────────
+//  CANVAS UPDATES  (bidirectional streaming)
+// ─────────────────────────────────────────────
+
+enum UpdateType {
+  STROKE_BEGIN  = 0;
+  STROKE_POINT  = 1;
+  STROKE_END    = 2;
+  LAYER_ADD     = 3;
+  LAYER_DELETE  = 4;
+  LAYER_MOVE    = 5;
+  CANVAS_CLEAR  = 6;
+  CURSOR_MOVE   = 7;
+}
+
+message StrokeData {
+  string  tool         = 1;
+  Color   stroke_color = 2;
+  Color   fill_color   = 3;
+  float   size         = 4;
+  float   opacity      = 5;
+  repeated Vec2 points = 6;
+  string  layer_id     = 7;
+}
+
+message CanvasUpdate {
+  string     session_id  = 1;
+  string     user_id     = 2;
+  string     username    = 3;
+  string     project_id  = 4;
+  UpdateType type        = 5;
+  int64      timestamp   = 6;
+
+  oneof payload {
+    StrokeData stroke      = 7;
+    Layer      layer       = 8;
+    Vec2       cursor      = 9;
+    string     layer_id    = 10;  // for LAYER_DELETE / CANVAS_CLEAR
+  }
+}
+
+// ─────────────────────────────────────────────
+//  REQUEST / RESPONSE MESSAGES
+// ─────────────────────────────────────────────
+
+// --- Session ---
+message CreateSessionRequest {
+  string username = 1;
+}
+message CreateSessionResponse {
+  Session session = 1;
+  string  token   = 2;
+}
+
+message ValidateSessionRequest {
+  string token = 1;
+}
+message ValidateSessionResponse {
+  bool    valid   = 1;
+  Session session = 2;
+}
+
+// --- Projects ---
+message SaveProjectRequest {
+  string  token   = 1;
+  Project project = 2;
+}
+message SaveProjectResponse {
+  bool   success    = 1;
+  string project_id = 2;
+  string message    = 3;
+}
+
+message LoadProjectRequest {
+  string token      = 1;
+  string project_id = 2;
+}
+message LoadProjectResponse {
+  bool    success = 1;
+  Project project = 2;
+  string  message = 3;
+}
+
+message ListProjectsRequest {
+  string token    = 1;
+  uint32 page     = 2;
+  uint32 per_page = 3;
+}
+message ListProjectsResponse {
+  repeated ProjectMeta projects = 1;
+  uint32 total                  = 2;
+  uint32 page                   = 3;
+}
+
+message DeleteProjectRequest {
+  string token      = 1;
+  string project_id = 2;
+}
+message DeleteProjectResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+message RenameProjectRequest {
+  string token      = 1;
+  string project_id = 2;
+  string new_name   = 3;
+}
+message RenameProjectResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// --- Export ---
+message ExportRequest {
+  string token      = 1;
+  string project_id = 2;
+  string format     = 3;   // "png" | "jpeg" | "bmp"
+  uint32 quality    = 4;   // 0-100 for jpeg
+}
+message ExportResponse {
+  bool   success   = 1;
+  bytes  data      = 2;   // encoded image bytes
+  string mime_type = 3;
+  string message   = 4;
+}
+
+// --- Collaboration stream subscription ---
+message JoinRoomRequest {
+  string token      = 1;
+  string project_id = 2;
+}
+
+// ─────────────────────────────────────────────
+//  SERVICE DEFINITION
+// ─────────────────────────────────────────────
+
+service RendererService {
+  // Session management
+  rpc CreateSession   (CreateSessionRequest)   returns (CreateSessionResponse);
+  rpc ValidateSession (ValidateSessionRequest)  returns (ValidateSessionResponse);
+
+  // Project CRUD
+  rpc SaveProject     (SaveProjectRequest)      returns (SaveProjectResponse);
+  rpc LoadProject     (LoadProjectRequest)      returns (LoadProjectResponse);
+  rpc ListProjects    (ListProjectsRequest)     returns (ListProjectsResponse);
+  rpc DeleteProject   (DeleteProjectRequest)    returns (DeleteProjectResponse);
+  rpc RenameProject   (RenameProjectRequest)    returns (RenameProjectResponse);
+
+  // Export
+  rpc ExportProject   (ExportRequest)           returns (ExportResponse);
+
+  // Real-time collaboration — bidirectional streaming
+  rpc Collaborate     (stream CanvasUpdate)     returns (stream CanvasUpdate);
+
+  // Server-side stream: receive all updates in a room
+  rpc JoinRoom        (JoinRoomRequest)         returns (stream CanvasUpdate);
+}
