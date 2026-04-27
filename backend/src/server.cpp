@@ -18,8 +18,10 @@ struct Config {
   std::string host         = "0.0.0.0";
   int         port         = 50051;
   std::string storage_root = "./storage";
-  int         max_recv_mb  = 64;   // max incoming message size
+  int         max_recv_mb  = 64;
   int         max_send_mb  = 64;
+  std::string redis_host   = "127.0.0.1";
+  int         redis_port   = 6379;
 };
 
 Config load_config() {
@@ -28,11 +30,13 @@ Config load_config() {
     const char* v = std::getenv(k);
     return v ? v : def;
   };
-  c.host         = env("RENDERER_HOST",    c.host);
-  c.port         = std::stoi(env("RENDERER_PORT",    std::to_string(c.port)));
-  c.storage_root = env("RENDERER_STORAGE", c.storage_root);
+  c.host         = env("RENDERER_HOST",     c.host);
+  c.port         = std::stoi(env("RENDERER_PORT",     std::to_string(c.port)));
+  c.storage_root = env("RENDERER_STORAGE",  c.storage_root);
   c.max_recv_mb  = std::stoi(env("RENDERER_MAX_RECV_MB", std::to_string(c.max_recv_mb)));
   c.max_send_mb  = std::stoi(env("RENDERER_MAX_SEND_MB", std::to_string(c.max_send_mb)));
+  c.redis_host   = env("REDIS_HOST",        c.redis_host);
+  c.redis_port   = std::stoi(env("REDIS_PORT",  std::to_string(c.redis_port)));
   return c;
 }
 
@@ -119,7 +123,7 @@ int main() {
   builder.experimental().SetInterceptorCreators(std::move(creators));
 
   // Register service
-  RendererServiceImpl service(cfg.storage_root);
+  RendererServiceImpl service(cfg.storage_root, cfg.redis_host, cfg.redis_port);
   builder.RegisterService(&service);
 
   // Build and start
@@ -136,6 +140,7 @@ int main() {
             << "╠══════════════════════════════════════╣\n"
             << "║  Address : " << addr << "\n"
             << "║  Storage : " << cfg.storage_root << "\n"
+            << "║  Redis   : " << cfg.redis_host << ":" << cfg.redis_port << "\n"
             << "║  MaxRecv : " << cfg.max_recv_mb << " MB\n"
             << "║  MaxSend : " << cfg.max_send_mb << " MB\n"
             << "╚══════════════════════════════════════╝\n";

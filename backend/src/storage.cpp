@@ -6,9 +6,10 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <iostream>
 
 // ─────────────────────────────────────────────────────────────────
-//  Token utilities
+//  Helpers
 // ─────────────────────────────────────────────────────────────────
 namespace token {
 
@@ -24,13 +25,10 @@ std::string generate(size_t len) {
   return out;
 }
 
-// Simple FNV-1a string hash → hex string (good enough for in-memory use)
+// FNV-1a → hex (used only as a fast key; not for security)
 std::string hash(const std::string& raw) {
   uint64_t h = 14695981039346656037ULL;
-  for (unsigned char c : raw) {
-    h ^= c;
-    h *= 1099511628211ULL;
-  }
+  for (unsigned char c : raw) { h ^= c; h *= 1099511628211ULL; }
   std::ostringstream oss;
   oss << std::hex << std::setw(16) << std::setfill('0') << h;
   return oss.str();
@@ -38,88 +36,70 @@ std::string hash(const std::string& raw) {
 
 } // namespace token
 
-// ─────────────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────────────
 static int64_t now_ms() {
   using namespace std::chrono;
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 static std::string new_uuid() {
-  // Simple UUID-like id from random bytes
   static thread_local std::mt19937_64 rng{ std::random_device{}() };
   std::uniform_int_distribution<uint64_t> dist;
   uint64_t a = dist(rng), b = dist(rng);
   std::ostringstream ss;
   ss << std::hex << std::setw(16) << std::setfill('0') << a
-     << std::setw(16) << std::setfill('0') << b;
+                 << std::setw(16) << std::setfill('0') << b;
   std::string s = ss.str();
-  // Format: 8-4-4-4-12
-  return s.substr(0,8) + "-" + s.substr(8,4) + "-" + s.substr(12,4)
-       + "-" + s.substr(16,4) + "-" + s.substr(20,12);
+  return s.substr(0,8)+"-"+s.substr(8,4)+"-"+s.substr(12,4)
+        +"-"+s.substr(16,4)+"-"+s.substr(20,12);
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  SessionStore
+//  SessionStore  (Redis-backed)
 // ─────────────────────────────────────────────────────────────────
+std::string SessionStore::session_key(const std::string& token_hash) {
+  return "session:" + token_hash;
+}
+
+SessionStore::SessionStore(RedisStore* redis) : redis_(redis) {}
+
 std::pair<renderer::Session, std::string>
 SessionStore::create(const std::string& username) {
-  std::lock_guard<std::mutex> lk(mu_);
-
   renderer::Session sess;
   sess.set_id(new_uuid());
   sess.set_user_id(new_uuid());
   sess.set_username(username);
   sess.set_created_at(now_ms());
-  // 7-day expiry
-  const int64_t TTL_MS = 7LL * 24 * 3600 * 1000;
-  sess.set_expires_at(sess.created_at() + TTL_MS);
+  sess.set_expires_at(sess.created_at() + static_cast<int64_t>(SESSION_TTL_S) * 1000);
 
   const std::string raw_token = token::generate(48);
   const std::string h         = token::hash(raw_token);
 
-  Entry e;
-  e.session    = sess;
-  e.token_hash = h;
-  e.expires_at = sess.expires_at();
+  std::string bytes;
+  sess.SerializeToString(&bytes);
+  redis_->set(session_key(h), bytes, SESSION_TTL_S);
 
-  // Remove any previous token for this user
-  auto it = user_token_.find(sess.user_id());
-  if (it != user_token_.end()) {
-    by_token_hash_.erase(it->second);
-  }
-  by_token_hash_[h]              = std::move(e);
-  user_token_[sess.user_id()]    = h;
-
+  std::cout << "[session] created user=" << username
+            << " id=" << sess.id() << "\n";
   return { sess, raw_token };
 }
 
 std::optional<renderer::Session>
 SessionStore::validate(const std::string& raw_token) const {
-  const std::string h = token::hash(raw_token);
-  std::lock_guard<std::mutex> lk(mu_);
-  auto it = by_token_hash_.find(h);
-  if (it == by_token_hash_.end()) return std::nullopt;
-  if (now_ms() > it->second.expires_at) return std::nullopt;
-  return it->second.session;
-}
+  const std::string h    = token::hash(raw_token);
+  auto              data = redis_->get(session_key(h));
+  if (!data) return std::nullopt;
 
-void SessionStore::purge_expired() {
-  std::lock_guard<std::mutex> lk(mu_);
-  const int64_t t = now_ms();
-  for (auto it = by_token_hash_.begin(); it != by_token_hash_.end(); ) {
-    if (t > it->second.expires_at) {
-      user_token_.erase(it->second.session.user_id());
-      it = by_token_hash_.erase(it);
-    } else {
-      ++it;
-    }
+  renderer::Session sess;
+  if (!sess.ParseFromString(*data)) return std::nullopt;
+  if (now_ms() > sess.expires_at()) {
+    redis_->del(session_key(h));  // clean up expired key early
+    return std::nullopt;
   }
+  return sess;
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  ProjectStore
+//  ProjectStore  (file-backed, unchanged from original)
 // ─────────────────────────────────────────────────────────────────
 ProjectStore::ProjectStore(const std::string& root_dir) : root_(root_dir) {
   fs::create_directories(root_);
@@ -134,7 +114,7 @@ fs::path ProjectStore::meta_path(const std::string& id) const {
 }
 
 bool ProjectStore::write_proto(const fs::path& p,
-                               const google::protobuf::Message& msg) {
+                                const google::protobuf::Message& msg) {
   std::string bytes;
   if (!msg.SerializeToString(&bytes)) return false;
   std::ofstream f(p, std::ios::binary | std::ios::trunc);
@@ -144,7 +124,7 @@ bool ProjectStore::write_proto(const fs::path& p,
 }
 
 bool ProjectStore::read_proto(const fs::path& p,
-                              google::protobuf::Message* msg) {
+                               google::protobuf::Message* msg) {
   std::ifstream f(p, std::ios::binary);
   if (!f) return false;
   std::string bytes((std::istreambuf_iterator<char>(f)),
@@ -152,13 +132,8 @@ bool ProjectStore::read_proto(const fs::path& p,
   return msg->ParseFromString(bytes);
 }
 
-std::string ProjectStore::new_id() const {
-  return new_uuid();
-}
-
-int64_t ProjectStore::now_ms() const {
-  return ::now_ms();
-}
+std::string ProjectStore::new_id() const { return new_uuid(); }
+int64_t     ProjectStore::now_ms() const { return ::now_ms(); }
 
 std::string ProjectStore::save(const renderer::Project& project) {
   std::lock_guard<std::mutex> lk(mu_);
@@ -170,7 +145,6 @@ std::string ProjectStore::save(const renderer::Project& project) {
   if (proj.created_at() == 0) proj.set_created_at(t);
   proj.set_updated_at(t);
 
-  // Build meta
   renderer::ProjectMeta meta;
   meta.set_id(proj.id());
   meta.set_name(proj.name());
@@ -206,7 +180,7 @@ ProjectStore::load_meta(const std::string& project_id) {
 
 std::vector<renderer::ProjectMeta>
 ProjectStore::list(const std::string& owner_id,
-                   uint32_t page, uint32_t per_page) {
+                    uint32_t page, uint32_t per_page) {
   std::lock_guard<std::mutex> lk(mu_);
   std::vector<renderer::ProjectMeta> results;
 
@@ -218,17 +192,16 @@ ProjectStore::list(const std::string& owner_id,
     results.push_back(std::move(meta));
   }
 
-  // Sort by updated_at descending
   std::sort(results.begin(), results.end(),
     [](const renderer::ProjectMeta& a, const renderer::ProjectMeta& b) {
       return a.updated_at() > b.updated_at();
     });
 
-  // Paginate
   const size_t start = static_cast<size_t>(page) * per_page;
   if (start >= results.size()) return {};
   const size_t end = std::min(start + per_page, results.size());
-  return { results.begin() + start, results.begin() + end };
+  return { results.begin() + static_cast<ptrdiff_t>(start),
+           results.begin() + static_cast<ptrdiff_t>(end) };
 }
 
 uint32_t ProjectStore::count(const std::string& owner_id) {
@@ -244,7 +217,7 @@ uint32_t ProjectStore::count(const std::string& owner_id) {
 }
 
 bool ProjectStore::remove(const std::string& project_id,
-                          const std::string& owner_id) {
+                            const std::string& owner_id) {
   std::lock_guard<std::mutex> lk(mu_);
   auto meta_p = meta_path(project_id);
   renderer::ProjectMeta meta;
@@ -256,8 +229,8 @@ bool ProjectStore::remove(const std::string& project_id,
 }
 
 bool ProjectStore::rename(const std::string& project_id,
-                          const std::string& owner_id,
-                          const std::string& new_name) {
+                            const std::string& owner_id,
+                            const std::string& new_name) {
   std::lock_guard<std::mutex> lk(mu_);
   auto meta_p = meta_path(project_id);
   renderer::ProjectMeta meta;
@@ -266,7 +239,6 @@ bool ProjectStore::rename(const std::string& project_id,
   meta.set_name(new_name);
   meta.set_updated_at(now_ms());
 
-  // Also update name in full project file
   renderer::Project proj;
   auto proj_p = project_path(project_id);
   if (read_proto(proj_p, &proj)) {
@@ -278,28 +250,46 @@ bool ProjectStore::rename(const std::string& project_id,
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  CollabRoom
+//  CollabRoom  (Redis pub/sub)
 // ─────────────────────────────────────────────────────────────────
+CollabRoom::CollabRoom(RedisStore* redis, std::string project_id)
+    : redis_(redis),
+      project_id_(std::move(project_id)),
+      channel_("project:" + project_id_)
+{}
+
 uint64_t CollabRoom::subscribe(const std::string& session_id,
-                               UpdateCallback cb) {
+                                UpdateCallback cb) {
   std::lock_guard<std::mutex> lk(mu_);
   const uint64_t id = next_id_++;
-  subs_[id] = { session_id, std::move(cb) };
+
+  // Wrap the callback: deserialize the Redis message bytes into a
+  // CanvasUpdate, filter out own session, then call the user callback.
+  auto wrapped = [session_id, cb = std::move(cb)](const std::string& msg_bytes) {
+    renderer::CanvasUpdate op;
+    if (!op.ParseFromString(msg_bytes)) return;
+    if (op.session_id() == session_id) return;  // skip own messages
+    cb(op);
+  };
+
+  subs_[id] = Sub{
+    session_id,
+    cb,  // kept for potential direct use; redis_sub drives actual delivery
+    redis_->subscribe(channel_, session_id, std::move(wrapped))
+  };
+
   return id;
 }
 
 void CollabRoom::unsubscribe(uint64_t sub_id) {
   std::lock_guard<std::mutex> lk(mu_);
-  subs_.erase(sub_id);
+  subs_.erase(sub_id);  // RedisSubscriber dtor stops the thread
 }
 
-void CollabRoom::broadcast(const renderer::CanvasUpdate& update,
-                           uint64_t except_sub) {
-  std::lock_guard<std::mutex> lk(mu_);
-  for (auto& [id, sub] : subs_) {
-    if (id == except_sub) continue;
-    sub.cb(update);
-  }
+void CollabRoom::broadcast(const renderer::CanvasUpdate& update) {
+  std::string bytes;
+  update.SerializeToString(&bytes);
+  redis_->publish(channel_, bytes);
 }
 
 size_t CollabRoom::subscriber_count() const {
@@ -310,11 +300,13 @@ size_t CollabRoom::subscriber_count() const {
 // ─────────────────────────────────────────────────────────────────
 //  RoomRegistry
 // ─────────────────────────────────────────────────────────────────
+RoomRegistry::RoomRegistry(RedisStore* redis) : redis_(redis) {}
+
 std::shared_ptr<CollabRoom>
 RoomRegistry::get_or_create(const std::string& project_id) {
   std::lock_guard<std::mutex> lk(mu_);
   auto& ptr = rooms_[project_id];
-  if (!ptr) ptr = std::make_shared<CollabRoom>();
+  if (!ptr) ptr = std::make_shared<CollabRoom>(redis_, project_id);
   return ptr;
 }
 

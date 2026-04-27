@@ -48,7 +48,10 @@ const state = {
   lastY: 0,
   startX: 0,
   startY: 0,
-  brushPoints: [],   // freehand accumulated points
+  // Float32Array: 2 floats per point (x,y), pre-allocated for 2048 points.
+  // Replaces plain {x,y} objects — zero GC pressure, 5× smaller per point.
+  brushPointsF32: new Float32Array(4096),
+  brushPointCount: 0,
 
   // selection
   selection: null,   // { x,y,w,h } in canvas space
@@ -308,7 +311,9 @@ function beginDraw(e) {
   state.startY  = y;
   state.lastX   = x;
   state.lastY   = y;
-  state.brushPoints = [{ x, y }];
+  state.brushPointsF32[0] = x;
+  state.brushPointsF32[1] = y;
+  state.brushPointCount   = 1;
 
   snapshotLayer(state.activeLayer);
 
@@ -341,11 +346,21 @@ function continueDraw(e) {
 
   const tool = state.tool;
   if (tool === 'pen' || tool === 'brush') {
-    state.brushPoints.push({ x, y });
-    drawSmoothedPath(ctx, state.brushPoints, tool === 'brush');
+    const i = state.brushPointCount * 2;
+    if (i + 1 < state.brushPointsF32.length) {
+      state.brushPointsF32[i]   = x;
+      state.brushPointsF32[i+1] = y;
+      state.brushPointCount++;
+    }
+    drawSmoothedPath(ctx, state.brushPointsF32, state.brushPointCount, tool === 'brush');
   } else if (tool === 'eraser') {
-    state.brushPoints.push({ x, y });
-    drawSmoothedPath(ctx, state.brushPoints, false, true);
+    const i = state.brushPointCount * 2;
+    if (i + 1 < state.brushPointsF32.length) {
+      state.brushPointsF32[i]   = x;
+      state.brushPointsF32[i+1] = y;
+      state.brushPointCount++;
+    }
+    drawSmoothedPath(ctx, state.brushPointsF32, state.brushPointCount, false, true);
   } else if (tool === 'rect') {
     drawRect(ctx, state.startX, state.startY, x, y);
   } else if (tool === 'ellipse') {
@@ -368,14 +383,14 @@ function endDraw(e) {
   if (!ctx) return;
   applyDrawStyle(ctx);
 
-  const { startX, startY, lastX, lastY, brushPoints, tool } = state;
+  const { startX, startY, lastX, lastY, brushPointsF32, brushPointCount, tool } = state;
 
   if (tool === 'pen' || tool === 'brush') {
-    drawSmoothedPath(ctx, brushPoints, tool === 'brush');
+    drawSmoothedPath(ctx, brushPointsF32, brushPointCount, tool === 'brush');
   } else if (tool === 'eraser') {
     const saved = ctx.globalCompositeOperation;
     ctx.globalCompositeOperation = 'destination-out';
-    drawSmoothedPath(ctx, brushPoints, false);
+    drawSmoothedPath(ctx, brushPointsF32, brushPointCount, false);
     ctx.globalCompositeOperation = saved;
   } else if (tool === 'rect') {
     drawRect(ctx, startX, startY, lastX, lastY);
@@ -389,8 +404,7 @@ function endDraw(e) {
 
   // Clear overlay
   overlayCtx.clearRect(0, 0, state.canvasW, state.canvasH);
-  // Release point pool
-  state.brushPoints.length = 0;
+  state.brushPointCount = 0;  // reset cursor; Float32Array buffer is reused
   compositeAll();
 }
 
@@ -404,22 +418,23 @@ function applyDrawStyle(ctx) {
 }
 
 /* ── Catmull-Rom smoothed path ── */
-function drawSmoothedPath(ctx, pts, pressure = false, erase = false) {
-  if (pts.length < 2) {
+// pts: Float32Array with interleaved [x0,y0, x1,y1, ...], count: number of points
+function drawSmoothedPath(ctx, pts, count, pressure = false, erase = false) {
+  if (count < 2) {
     ctx.beginPath();
-    ctx.arc(pts[0].x, pts[0].y, ctx.lineWidth / 2, 0, Math.PI * 2);
+    ctx.arc(pts[0], pts[1], ctx.lineWidth / 2, 0, Math.PI * 2);
     ctx.fill();
     return;
   }
   if (erase) ctx.globalCompositeOperation = 'destination-out';
   ctx.beginPath();
-  ctx.moveTo(pts[0].x, pts[0].y);
-  for (let i = 1; i < pts.length - 1; i++) {
-    const mx = (pts[i].x + pts[i + 1].x) / 2;
-    const my = (pts[i].y + pts[i + 1].y) / 2;
-    ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+  ctx.moveTo(pts[0], pts[1]);
+  for (let i = 1; i < count - 1; i++) {
+    const mx = (pts[i*2] + pts[(i+1)*2])     / 2;
+    const my = (pts[i*2+1] + pts[(i+1)*2+1]) / 2;
+    ctx.quadraticCurveTo(pts[i*2], pts[i*2+1], mx, my);
   }
-  ctx.lineTo(pts.at(-1).x, pts.at(-1).y);
+  ctx.lineTo(pts[(count-1)*2], pts[(count-1)*2+1]);
   ctx.stroke();
   if (erase) ctx.globalCompositeOperation = 'source-over';
 }
@@ -552,10 +567,12 @@ function commitText() {
 /* ═══════════════════════════════════════════════════
    12. COLOR WHEEL  (HSV-based)
 ═══════════════════════════════════════════════════ */
+let _cwImageData = null;  // reused across calls — avoids repeated heap allocation
 function drawColorWheel() {
   const W = colorWheel.width, H = colorWheel.height;
   const cx = W / 2, cy = H / 2, r = Math.min(cx, cy) - 2;
-  const img = cwCtx.createImageData(W, H);
+  if (!_cwImageData) _cwImageData = cwCtx.createImageData(W, H);
+  const img = _cwImageData;
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const dx = x - cx, dy = y - cy;
@@ -936,3 +953,189 @@ function init() {
 }
 
 init();
+
+/* ═══════════════════════════════════════════════════
+   21. COLLABORATION + OT CLIENT
+   Connects via WebSocket to a bridge that forwards
+   messages to the gRPC Collaborate RPC on the backend.
+
+   OT protocol:
+     - Every outgoing op carries base_revision (what
+       revision the client was at when the op was made).
+     - Server transforms and replies with the same op
+       carrying the assigned revision (ack).
+     - Incoming remote ops are transformed against any
+       local pending ops before being applied.
+═══════════════════════════════════════════════════ */
+const collab = (() => {
+  let ws            = null;
+  let sessionId     = '';
+  let projectId     = '';
+  let localRevision = 0;
+  const pendingOps  = [];   // ops sent but not yet ack'd by server
+
+  // ── OT transform (mirrors service.cpp::ot_transform) ──────────
+  function transformOp(op_a, op_b) {
+    const a = Object.assign({}, op_a);
+
+    // Stroke on a deleted/cleared layer → cancel
+    if (a.type === 'STROKE_END') {
+      if ((op_b.type === 'LAYER_DELETE' || op_b.type === 'CANVAS_CLEAR') &&
+          op_b.layer_id === a.stroke?.layer_id)
+        return { ...a, type: 'NOOP' };
+    }
+
+    // Duplicate LAYER_DELETE → skip
+    if (a.type === 'LAYER_DELETE' && op_b.type === 'LAYER_DELETE' &&
+        a.layer_id === op_b.layer_id)
+      return { ...a, type: 'NOOP' };
+
+    // Concurrent LAYER_MOVE → adjust order index
+    if (a.type === 'LAYER_MOVE' && op_b.type === 'LAYER_MOVE') {
+      if (op_b.layer.order <= a.layer.order)
+        return { ...a, layer: { ...a.layer, order: a.layer.order + 1 } };
+    }
+
+    return a;
+  }
+
+  // ── Apply a remote op to the local canvas ─────────────────────
+  function applyRemoteOp(op) {
+    if (op.type === 'NOOP') return;
+
+    if (op.type === 'STROKE_END' && op.stroke) {
+      const layer = state.layers.find(l => l.id === op.stroke.layer_id);
+      if (!layer) return;
+      const ctx = layer.offscreen.getContext('2d');
+      ctx.globalAlpha  = op.stroke.opacity ?? 1;
+      ctx.lineWidth    = op.stroke.size ?? 4;
+      ctx.lineCap      = 'round';
+      ctx.lineJoin     = 'round';
+      ctx.strokeStyle  = op.stroke.stroke_color ?? '#000';
+      if (op.stroke.points?.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(op.stroke.points[0].x, op.stroke.points[0].y);
+        for (let i = 1; i < op.stroke.points.length - 1; i++) {
+          const mx = (op.stroke.points[i].x + op.stroke.points[i+1].x) / 2;
+          const my = (op.stroke.points[i].y + op.stroke.points[i+1].y) / 2;
+          ctx.quadraticCurveTo(op.stroke.points[i].x, op.stroke.points[i].y, mx, my);
+        }
+        ctx.lineTo(op.stroke.points.at(-1).x, op.stroke.points.at(-1).y);
+        ctx.stroke();
+      }
+      compositeAll();
+    }
+
+    if (op.type === 'LAYER_DELETE') {
+      const idx = state.layers.findIndex(l => l.id === op.layer_id);
+      if (idx !== -1) deleteLayer(idx);
+    }
+
+    if (op.type === 'CANVAS_CLEAR') {
+      const layer = state.layers.find(l => l.id === op.layer_id);
+      if (layer) {
+        layer.offscreen.getContext('2d')
+          .clearRect(0, 0, state.canvasW, state.canvasH);
+        compositeAll();
+      }
+    }
+
+    if (op.type === 'CURSOR_MOVE' && op.cursor) {
+      // Optional: render remote cursor indicator
+    }
+  }
+
+  // ── Send an op to the server ───────────────────────────────────
+  function send(op) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const msg = {
+      session_id:    sessionId,
+      project_id:    projectId,
+      base_revision: localRevision,
+      ...op,
+    };
+    pendingOps.push(msg);
+    ws.send(JSON.stringify(msg));
+  }
+
+  // ── Handle message from server ─────────────────────────────────
+  function onMessage(raw) {
+    const op = JSON.parse(raw);
+
+    // Ack: server echoes our own op back with an assigned revision
+    if (op.session_id === sessionId && op.revision != null) {
+      pendingOps.shift();
+      localRevision = op.revision;
+      return;
+    }
+
+    // Remote op from another user: transform against pending local ops
+    let transformed = op;
+    for (const pending of pendingOps)
+      transformed = transformOp(transformed, pending);
+
+    if (op.revision != null)
+      localRevision = Math.max(localRevision, op.revision);
+
+    applyRemoteOp(transformed);
+  }
+
+  // ── Public API ─────────────────────────────────────────────────
+  return {
+    connect(wsUrl, sid, pid) {
+      sessionId = sid;
+      projectId = pid;
+      ws = new WebSocket(wsUrl);
+      ws.onmessage = e => onMessage(e.data);
+      ws.onopen    = () => {
+        console.log('[collab] connected');
+        ws.send(JSON.stringify({ session_id: sessionId, project_id: projectId,
+                                  type: 'STROKE_BEGIN' }));
+      };
+      ws.onclose   = () => console.log('[collab] disconnected');
+      ws.onerror   = e => console.error('[collab] error', e);
+    },
+
+    disconnect() { ws?.close(); },
+
+    sendStroke(layerId, points, tool, color, size, opacity) {
+      send({
+        type:   'STROKE_END',
+        stroke: { layer_id: layerId, tool, stroke_color: color,
+                  size, opacity, points },
+      });
+    },
+
+    sendCursor(x, y) {
+      send({ type: 'CURSOR_MOVE', cursor: { x, y } });
+    },
+
+    sendLayerDelete(layerId) {
+      send({ type: 'LAYER_DELETE', layer_id: layerId });
+    },
+
+    sendCanvasClear(layerId) {
+      send({ type: 'CANVAS_CLEAR', layer_id: layerId });
+    },
+
+    get connected() { return ws?.readyState === WebSocket.OPEN; },
+  };
+})();
+
+// ── Hook collaboration into existing draw events ───────────────
+// Snapshot Float32Array into plain objects for JSON wire format,
+// then commit the stroke locally and broadcast.
+const _origEndDraw = endDraw;
+window.endDraw = function(e) {
+  const count   = state.brushPointCount;
+  const layerId = state.layers[state.activeLayer]?.id;
+  // Snapshot before endDraw resets brushPointCount
+  const points = [];
+  for (let i = 0; i < count; i++)
+    points.push({ x: state.brushPointsF32[i*2], y: state.brushPointsF32[i*2+1] });
+  _origEndDraw(e);
+  if (collab.connected && layerId && points.length > 1) {
+    collab.sendStroke(layerId, points, state.tool, state.strokeColor,
+                      state.size, state.opacity);
+  }
+};

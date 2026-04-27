@@ -6,11 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ─────────────────────────────────────────────────────────────────
-#  Find gRPC + Protobuf
-#  Install via: vcpkg install grpc  OR  brew install grpc
+#  Find gRPC + Protobuf + hiredis
+#  Install via: vcpkg install grpc hiredis
 # ─────────────────────────────────────────────────────────────────
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC     CONFIG REQUIRED)
+find_package(hiredis  CONFIG REQUIRED)
 
 # Resolve protoc + grpc_cpp_plugin binaries
 set(PROTOC       $<TARGET_FILE:protobuf::protoc>)
@@ -59,6 +60,7 @@ add_executable(renderer_server
   src/server.cpp
   src/service.cpp
   src/storage.cpp
+  src/redis_client.cpp
 )
 target_include_directories(renderer_server PRIVATE "${PROTO_OUT}")
 target_link_libraries(renderer_server PRIVATE
@@ -66,6 +68,7 @@ target_link_libraries(renderer_server PRIVATE
   gRPC::grpc++
   gRPC::grpc++_reflection
   protobuf::libprotobuf
+  hiredis::hiredis
 )
 
 # ─────────────────────────────────────────────────────────────────

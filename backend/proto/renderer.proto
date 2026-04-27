@@ -88,6 +88,7 @@ enum UpdateType {
   LAYER_MOVE    = 5;
   CANVAS_CLEAR  = 6;
   CURSOR_MOVE   = 7;
+  NOOP          = 8;   // OT cancelled this op (server-side only)
 }
 
 message StrokeData {
@@ -101,12 +102,12 @@ message StrokeData {
 }
 
 message CanvasUpdate {
-  string     session_id  = 1;
-  string     user_id     = 2;
-  string     username    = 3;
-  string     project_id  = 4;
-  UpdateType type        = 5;
-  int64      timestamp   = 6;
+  string     session_id    = 1;
+  string     user_id       = 2;
+  string     username      = 3;
+  string     project_id    = 4;
+  UpdateType type          = 5;
+  int64      timestamp     = 6;
 
   oneof payload {
     StrokeData stroke      = 7;
@@ -114,6 +115,9 @@ message CanvasUpdate {
     Vec2       cursor      = 9;
     string     layer_id    = 10;  // for LAYER_DELETE / CANVAS_CLEAR
   }
+
+  int64 revision      = 11;  // server-assigned revision after OT commit
+  int64 base_revision = 12;  // client sends: "I was at this revision when I made this op"
 }
 
 // ─────────────────────────────────────────────

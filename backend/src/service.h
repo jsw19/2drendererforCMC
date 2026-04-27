@@ -6,77 +6,70 @@
 #include <grpcpp/grpcpp.h>
 #include "../proto/renderer.grpc.pb.h"
 #include "storage.h"
+#include "redis_client.h"
 
 // ─────────────────────────────────────────────────────────────────
 //  RendererServiceImpl
-//  Implements all RPCs defined in renderer.proto
 // ─────────────────────────────────────────────────────────────────
 class RendererServiceImpl final : public renderer::RendererService::Service {
 public:
-  explicit RendererServiceImpl(const std::string& storage_root);
+  RendererServiceImpl(const std::string& storage_root,
+                      const std::string& redis_host,
+                      int                redis_port);
 
   // ── Session ──────────────────────────────────────────────────
   grpc::Status CreateSession(
-      grpc::ServerContext* ctx,
-      const renderer::CreateSessionRequest* req,
-      renderer::CreateSessionResponse* resp) override;
+      grpc::ServerContext*, const renderer::CreateSessionRequest*,
+      renderer::CreateSessionResponse*) override;
 
   grpc::Status ValidateSession(
-      grpc::ServerContext* ctx,
-      const renderer::ValidateSessionRequest* req,
-      renderer::ValidateSessionResponse* resp) override;
+      grpc::ServerContext*, const renderer::ValidateSessionRequest*,
+      renderer::ValidateSessionResponse*) override;
 
   // ── Projects ─────────────────────────────────────────────────
   grpc::Status SaveProject(
-      grpc::ServerContext* ctx,
-      const renderer::SaveProjectRequest* req,
-      renderer::SaveProjectResponse* resp) override;
+      grpc::ServerContext*, const renderer::SaveProjectRequest*,
+      renderer::SaveProjectResponse*) override;
 
   grpc::Status LoadProject(
-      grpc::ServerContext* ctx,
-      const renderer::LoadProjectRequest* req,
-      renderer::LoadProjectResponse* resp) override;
+      grpc::ServerContext*, const renderer::LoadProjectRequest*,
+      renderer::LoadProjectResponse*) override;
 
   grpc::Status ListProjects(
-      grpc::ServerContext* ctx,
-      const renderer::ListProjectsRequest* req,
-      renderer::ListProjectsResponse* resp) override;
+      grpc::ServerContext*, const renderer::ListProjectsRequest*,
+      renderer::ListProjectsResponse*) override;
 
   grpc::Status DeleteProject(
-      grpc::ServerContext* ctx,
-      const renderer::DeleteProjectRequest* req,
-      renderer::DeleteProjectResponse* resp) override;
+      grpc::ServerContext*, const renderer::DeleteProjectRequest*,
+      renderer::DeleteProjectResponse*) override;
 
   grpc::Status RenameProject(
-      grpc::ServerContext* ctx,
-      const renderer::RenameProjectRequest* req,
-      renderer::RenameProjectResponse* resp) override;
+      grpc::ServerContext*, const renderer::RenameProjectRequest*,
+      renderer::RenameProjectResponse*) override;
 
   // ── Export ───────────────────────────────────────────────────
   grpc::Status ExportProject(
-      grpc::ServerContext* ctx,
-      const renderer::ExportRequest* req,
-      renderer::ExportResponse* resp) override;
+      grpc::ServerContext*, const renderer::ExportRequest*,
+      renderer::ExportResponse*) override;
 
   // ── Real-time collaboration ───────────────────────────────────
   grpc::Status Collaborate(
-      grpc::ServerContext* ctx,
+      grpc::ServerContext*,
       grpc::ServerReaderWriter<renderer::CanvasUpdate,
-                               renderer::CanvasUpdate>* stream) override;
+                               renderer::CanvasUpdate>*) override;
 
   grpc::Status JoinRoom(
-      grpc::ServerContext* ctx,
-      const renderer::JoinRoomRequest* req,
-      grpc::ServerWriter<renderer::CanvasUpdate>* writer) override;
+      grpc::ServerContext*, const renderer::JoinRoomRequest*,
+      grpc::ServerWriter<renderer::CanvasUpdate>*) override;
 
 private:
-  SessionStore                sessions_;
+  RedisStore                    redis_;
+  SessionStore                  sessions_;
   std::unique_ptr<ProjectStore> projects_;
-  RoomRegistry                rooms_;
+  RoomRegistry                  rooms_;
 
-  // Validate token, populate session; returns error status on failure
+  alignas(64) std::atomic<uint64_t> active_streams_{ 0 };
+
   grpc::Status auth(const std::string& token,
                     renderer::Session* out_session);
-
-  std::atomic<uint64_t> active_streams_{ 0 };
 };
